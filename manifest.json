@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "論文PDF → 1カラムHTML",
+  "version": "1.1.0",
+  "description": "表示中の論文PDFを読みやすい1カラムHTMLに変換して新しいタブで開く。図・数式は画像のまま保持。ブラウザの自動翻訳と組み合わせて使う。",
+  "permissions": ["activeTab", "scripting"],
+  "host_permissions": ["<all_urls>"],
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
+  "action": {
+    "default_title": "このPDFをHTML化",
+    "default_icon": {
+      "16": "icon16.png",
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}

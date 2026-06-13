@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF → HTML 変換中…</title>
+<style id="viewer-style">
+  body { font-family: "Meiryo UI", sans-serif; max-width: 760px;
+         margin: 3rem auto; padding: 0 1rem; color: #333; }
+  #status { font-size: 15px; padding: 1em; background: #f0f4ff;
+            border-radius: 8px; }
+  #status.error { background: #ffefef; color: #a00; }
+  #toolbar { position: fixed; top: 8px; right: 8px; z-index: 10; }
+  #toolbar button { font-size: 12px; padding: 4px 10px; cursor: pointer;
+                    background: #fff; border: 1px solid #bbb; border-radius: 6px; }
+</style>
+</head>
+<body>
+<div id="status">変換を開始しています…</div>
+<script type="module" src="viewer.js"></script>
+</body>
+</html>
