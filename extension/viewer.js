@@ -1,6 +1,6 @@
 // viewer.js — 変換の進行表示と結果の描画
 import * as pdfjsLib from "./pdf.min.mjs";
-import { convertPdfToHtml } from "./converter.js";
+import { convertPdfToHtml, initCitePopups } from "./converter.js";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL("./pdf.worker.min.mjs", import.meta.url).href;
 
@@ -30,6 +30,7 @@ function buildStandaloneHtml(result) {
 </head>
 <body>
 ${result.bodyHtml}
+<script>${result.popupScript}</script>
 </body>
 </html>`;
 }
@@ -87,6 +88,10 @@ async function main() {
     `<div id="toolbar"><button id="save-btn">HTMLを保存</button></div>` +
     result.bodyHtml;
   console.log("pdf2html:", result.summary);
+
+  // 引用ポップアップを有効化。MV3拡張ページではインラインscriptがCSPで実行
+  // できないため、モジュール関数を直接呼ぶ(script要素の注入は不可)
+  initCitePopups();
 
   document.getElementById("save-btn").addEventListener("click", () => {
     const blob = new Blob([buildStandaloneHtml(result)], { type: "text/html" });

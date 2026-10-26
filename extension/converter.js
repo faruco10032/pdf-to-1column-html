@@ -1,11 +1,10 @@
-// converter.js — 論文PDFを1カラムHTMLに変換するパイプライン (pdf2html.py のJS移植)
+// converter.js — 論文PDFを1カラムHTMLに変換するパイプライン
 //
-// PyMuPDF版との主な違い:
 // - ブロック/行構造はPDF.jsのtextContentアイテムから自前で再構築する
 // - 図領域は「ページをCanvasに描画 → テキスト矩形を消去 → 残ったインクの
-//   連結成分」として検出する (cluster_drawings相当)
+//   連結成分」として検出する
 
-// ---------------------------------------------------------------- 定数 (Python版と同値)
+// ---------------------------------------------------------------- 定数
 
 const MARGIN_ZONE = 80;  // ACMはヘッダーがy≈62と深い位置にあるため広めにとる
 const FIG_MIN_AREA = 500;
@@ -28,6 +27,13 @@ const JOURNAL_HEAD_RE = /\bVOL\.\s*\d+|\bNO\.\s*\d+|^(IEEE|PROCEEDINGS OF)\b/i;
 const PAGE_NUM_RE = /^\s*(page\s*)?\d{1,4}\s*$/i;
 const SENT_END_RE = /[.!?:;]["”)\]]*\s*$/;
 const REFS_HEAD_RE = /^(?:[IVXLCDM]+\.\s*|\d+\.?\s*)?(References|Bibliography|REFERENCES|参考文献|引用文献)$/;
+// 文献ゾーンのスキャンを打ち切るべき既知のセクション語 (これ以外の全大文字1語
+// 見出しは文献タイトル断片の誤爆とみなしてゾーンに取り込む)
+const SECTION_WORDS = new Set(["ACKNOWLEDGMENT", "ACKNOWLEDGMENTS",
+  "ACKNOWLEDGEMENT", "ACKNOWLEDGEMENTS", "APPENDIX", "APPENDICES",
+  "REFERENCES", "BIBLIOGRAPHY", "SUPPLEMENTARY", "BIOGRAPHY"]);
+const isJunkHeadFragment = (t) =>
+  /^[A-Z]{3,14}$/.test(t.trim()) && !SECTION_WORDS.has(t.trim());
 const CJK_RE = /[぀-ヿ一-鿿]/;
 // 番号付き見出し ("1 INTRODUCTION", "3.2 Synjet ...", "3. 実験")。
 // 英文は番号の後が大文字 ("2 mm nozzle" を弾く)。
@@ -100,7 +106,10 @@ function mergeRects(rects, xGap = 25, yGap = 12, protectedRects = []) {
 const escapeHtml = (s) =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
-const normText = (s) => s.replace(/ /g, " ").replace(/­/g, "-")
+// ゼロ幅文字(DOI内の改行禁止ジョイナ等)は検索・リンク化を壊すので除去
+const ZERO_WIDTH_RE = /[\u200b\u200c\u200d\u2060\ufeff]/g;
+const normText = (s) => s.replace(/\u00a0/g, " ").replace(/\u00ad/g, "-")
+  .replace(ZERO_WIDTH_RE, "")
   .replace(/ﬀ/g, "ff").replace(/ﬁ/g, "fi").replace(/ﬂ/g, "fl")
   .replace(/ﬃ/g, "ffi").replace(/ﬄ/g, "ffl");
 
@@ -245,6 +254,9 @@ async function extractPage(page) {
     const t = normHeading(ln.text);
     if (!t || t.length > 90 || SENT_END_RE.test(t)) return false;
     if (/[,]/.test(t)) return false;  // 著者名リスト等 ("A. Bicchi, ...") を除外
+    // "References" 等のセクション語1行は本文と同スタイルでも見出し
+    // (本文直後に文献リストが続くジャーナルで先頭エントリに融合するのを防ぐ)
+    if (REFS_HEAD_RE.test(t) || SECTION_WORDS.has(t.toUpperCase())) return true;
     const periods = (t.match(/\./g) || []).length;
     // 節見出しはピリオド1個だけ ("A. Method")。複数あるのは文献の著者名
     // ("C. M. Bishop. Neural ...") なので除外
@@ -286,8 +298,75 @@ async function extractPage(page) {
       blocks.push({ lines: [ln], rect: { ...ln.rect } });
     }
   }
-  for (const bl of blocks) finishBlock(bl);
-  return { pageRect, blocks, allLineRects: lines.map((l) => l.rect) };
+  // 字下げ等で複数段落が融合したブロックを段落単位に分割してから確定する
+  const splitBlocks = [];
+  for (const bl of blocks) splitBlocks.push(...splitParagraphBlock(bl));
+  for (const bl of splitBlocks) finishBlock(bl);
+  return { pageRect, blocks: splitBlocks, allLineRects: lines.map((l) => l.rect) };
+}
+
+const PARA_INDENT_MIN = 7, PARA_INDENT_MAX = 40;
+
+// 1ブロックに融合した複数の段落を行の幾何情報で分割する。
+// LaTeX系論文は段落間に縦余白がなく字下げだけで段落を示すため、
+// ブロック抽出では複数段落が1つに融合する。境界の判定:
+//   (1) 字下げ: 行頭が左端より7〜40pt右で、前の行は左端揃え
+//   (2) 短い行末: 両端揃えのテキストで前の行が右端に届いていない
+//   (3) 全角スペース字下げ (日本語)
+// ガード: 同一ベースライン上では分割しない / 20文字未満の断片を作る分割は取り消す
+function splitParagraphBlock(bl) {
+  const lines = bl.lines;
+  const n = lines.length;
+  if (bl.forced || n < 3) return [bl];
+  const left = Math.min(...lines.map((l) => l.rect.x0));
+  const right = Math.max(...lines.map((l) => l.rect.x1));
+  const width = right - left;
+  if (width < 120) return [bl];
+  const indents = lines.map((l) => l.rect.x0 - left);
+  const fracInd = indents.filter((d) => d >= PARA_INDENT_MIN).length / n;
+  let fullN = 0;
+  for (let i = 0; i < n - 1; i++) {
+    if (lines[i].rect.x1 >= right - 0.04 * width) fullN++;
+  }
+  const justified = fullN / (n - 1) >= 0.6;
+
+  const breaks = [];
+  for (let i = 1; i < n; i++) {
+    // 同じベースライン上の行同士 (ラン・イン見出しの番号 "4.3.1" 等) では分割しない
+    if (lines[i].rect.y0 < lines[i - 1].rect.y1 - 2) continue;
+    const d = indents[i], pd = indents[i - 1];
+    const raw = lines[i].spans.length ? lines[i].spans[0].text : "";
+    const indentStart = d >= PARA_INDENT_MIN && d <= PARA_INDENT_MAX &&
+      pd < 4 && fracInd < 0.5;
+    const shortPrev = justified && d < 4 &&
+      lines[i - 1].rect.x1 < right - Math.max(18, 0.12 * width);
+    const zenIndent = raw.startsWith("　");
+    if (indentStart || shortPrev || zenIndent) breaks.push(i);
+  }
+  if (!breaks.length) return [bl];
+
+  const groups = [];
+  let prev = 0;
+  for (const b of breaks.concat([n])) {
+    if (b > prev) groups.push(lines.slice(prev, b));
+    prev = b;
+  }
+  // 20文字未満の断片を作る分割は取り消す (単語断片が見出し等に誤爆するのを防ぐ)
+  const gText = (g) => g.map((l) => l.text).join(" ").trim();
+  const healed = [];
+  for (const g of groups) {
+    if (healed.length && (gText(g).length < 20 || gText(healed[healed.length - 1]).length < 20)) {
+      healed[healed.length - 1].push(...g);
+    } else {
+      healed.push(g.slice());
+    }
+  }
+  if (healed.length <= 1) return [bl];
+  return healed.map((g) => {
+    let r = { ...g[0].rect };
+    for (const ln of g) r = rUnion(r, ln.rect);
+    return { ...bl, lines: g, rect: r };
+  });
 }
 
 function makeLine(spans) {
@@ -459,6 +538,9 @@ function isMarginJunk(bl, pageRect, repeated) {
   const cy = (bl.rect.y0 + bl.rect.y1) / 2;
   if (cy >= MARGIN_ZONE && cy <= pageRect.y1 - MARGIN_ZONE) return false;
   const t = bl.plain;
+  // 文献エントリ ("[25] ..." — 本文に vol./no. を含みジャーナルヘッダーと
+  // 紛らわしい) はマージン付近にあってもノイズ扱いしない
+  if (/^\[\d{1,3}\]\s/.test(t)) return false;
   if (PAGE_NUM_RE.test(t)) return true;
   if (t.toLowerCase().startsWith("arxiv:")) return true;
   if (JOURNAL_HEAD_RE.test(t)) return true;
@@ -760,6 +842,14 @@ function blockToHtml(block, crop, stats) {
 
 // ---------------------------------------------------------------- 参考文献
 
+// 文献リストの直後に続く著者略歴 ("Akira ASANO (Member) received the B.E. degree ...",
+// "Markus Grüner received his Ph.D. ...") の先頭。文献ゾーンの終端判定に使う
+const BIO_START_RE = new RegExp(
+  "^(?:\\p{Lu}[\\p{L}\\p{M}'’-]+\\s+){1,3}(?:\\([^)]{0,30}\\)\\s*)?(?:\\p{Lu}[\\p{L}\\p{M}'’-]+\\s+){0,3}" +
+  "(?:received|graduated|is currently|is an? |was born|obtained|earned|joined)\\b" +
+  // 「氏名 (Member)」だけの短い行 (写真横の名前行) も略歴の先頭とみなす
+  "|^(?:\\p{Lu}[\\p{L}\\p{M}'’-]+\\s+){1,4}\\([^)]{0,30}\\)\\s*$", "u");
+
 function rebuildReferences(chunks) {
   let start = -1;
   for (let i = 0; i < chunks.length; i++) {
@@ -791,9 +881,14 @@ function rebuildReferences(chunks) {
   const zone = [];
   const keptFigs = [];
   while (end < chunks.length) {
-    const k = chunks[end].kind;
-    if (k === "body" || k === "footnote") zone.push(chunks[end]);
-    else if (k === "figure" || k === "math") keptFigs.push(chunks[end]);
+    const c2 = chunks[end];
+    const k = c2.kind;
+    if (k === "body" || k === "footnote") {
+      if (BIO_START_RE.test(c2.plain)) break;   // 著者略歴が始まったら文献ゾーン終了
+      zone.push(c2);
+    }
+    else if (k === "figure" || k === "math") keptFigs.push(c2);
+    else if (k === "heading" && isJunkHeadFragment(c2.plain)) zone.push(c2);
     else break;
     end++;
   }
@@ -809,7 +904,7 @@ function rebuildReferences(chunks) {
   let joined = cleanZone.map((c) => c.html).join(" ");
   joined = joined.replace(/(\w)-((?:<\/[ib]>)*) ((?:<[ib]>)*)(?=[a-z])/g, "$1$2$3");
   joined = joined.replace(/(\w)-((?:<\/[ib]>)*) ((?:<[ib]>)*)(?=[A-Z])/g, "$1-$2$3");
-  joined = joined.replace(URL_WRAP_RE, "$1");  // 折り返しで分断されたDOI/URLを再結合
+  joined = repairWrappedUrls(joined);  // 折り返しで分断されたDOI/URLを再結合
 
   const starts = [];
   let expected = 1;
@@ -833,11 +928,37 @@ function rebuildReferences(chunks) {
            nRefs: refs.length };
 }
 
-// [著者 年] 形式の引用 (例: [Gugenheimer et al. 2016], [Halvey and Smith 2012])
-const AY_PART_RE = /([A-Z][\w'’-]+)(?:\s+(?:et\s+al\.?|and\s+[A-Z][\w'’-]+))?\s+(\d{4}[a-z]?)/g;
+// 著者-年の引用1件分 (例: "Gugenheimer et al. 2016", "Simeone et al., 2015",
+// "Ernst & Banks, 2002", "Lombard and Ditton 1997", "Minsky 1980")。
+// 年の前のカンマは任意、"et al" のピリオドも任意、接続は and / &。
+// HTML側では "&" が "&amp;" にエスケープされているため、その形も受け付ける。
+// 名前は \p{L} でアクセント付き文字 (Clément, Périard) も許容 (u フラグ必須)。
+// 企業名 "3M Co., 2016" のような数字始まりも許す
+const AY_WORD = "[\\p{L}\\p{M}'’-]+";
+// 団体名 "World Health Organization, 2019" のような複数語(最大3語)も許す
+// 姓の頭文字はアクセント付き大文字 (Özkardeşler) も許す (\p{Lu})
+const AY_PART_SRC = "([\\p{Lu}0-9]" + AY_WORD + ")(?:\\s+(?:et\\s+al\\.?|(?:and|&amp;|&)\\s+\\p{Lu}" + AY_WORD + ")" +
+  "|(?:\\s+\\p{Lu}[\\p{L}\\p{M}'’-]*\\.?){1,2})?,?\\s+(\\d{4}[a-z]?)";
+const AY_PART_RE = new RegExp(AY_PART_SRC, "gu");
+// 地の文の引用 "Simeone et al. (2015)" / "Ernst and Banks (2002)"
+const AY_NARR_RE = new RegExp(
+  "(\\p{Lu}" + AY_WORD + "(?:\\s+(?:et\\s+al\\.?|(?:and|&amp;|&)\\s+\\p{Lu}" + AY_WORD + "))?)\\s*\\((\\d{4}[a-z]?)\\)", "gu");
+// 文献エントリ先頭の検出。名前トークンの連なりが
+//   ACM形式: ". YEAR."          (Zikun Chen, ... Minamizawa. 2017. Title ...)
+//   APA形式: " (YEAR[, 補足])." (Simeone, A. L., ..., & Gellersen, H. (2015). Title ...)
+// で終わる箇所。APA形式は前エントリの終端(. ? ! または末尾のDOI/URL)直後に限定して
+// 誤爆を防ぐ (DOIで終わるエントリはピリオドで閉じないことが多い)。
+// APA形式は筆頭が企業名 ("3M Co. (2016).") の数字始まりも許す
+// イニシャルはハイフン連結 ("Y.-H.") も許す
+const AY_NAME = "(?:\\p{Lu}[\\p{L}\\p{M}'’\\-]*\\.?|\\p{Lu}\\.(?:-\\p{Lu}\\.)?|and|&|de|van|von|der|den|del|di|da|dos|la|le|el)";
+const AY_ENTRY_SRC = AY_NAME + "(?:[\\s,]+" + AY_NAME + ")*\\.\\s*((?:19|20)\\d\\d[a-z]?)\\.";
+const AY_ENTRY_APA_SRC = "(?<=^|[.?!][\"”)\\]]*\\s|https?://\\S+\\s)(?:\\d+[A-Z]\\w*|" + AY_NAME +
+  ")(?:[\\s,]+" + AY_NAME + ")*,?\\s*\\(\\s*((?:19|20)\\d\\d[a-z]?)[^)]*\\)";
 
-// 著者-年形式の論文向け: 文献ゾーンのチャンクにアンカーを付け、
-// 本文中の [著者 年] 引用をリンクにする。番号形式の再構築が失敗した場合に使う
+const AY_REFS_INLINE_RE = /^(References|Bibliography|REFERENCES)\s+(?=[A-Z0-9])/;
+
+// 著者-年形式の論文向け。文献ゾーンを「著者… YEAR.」境界で個別エントリに再分割し、
+// 本文中の [著者 年] 引用を対応エントリへリンクする。番号形式が失敗した場合に使う
 function rebuildReferencesAuthorYear(chunks) {
   let start = -1;
   for (let i = 0; i < chunks.length; i++) {
@@ -846,67 +967,155 @@ function rebuildReferencesAuthorYear(chunks) {
       break;
     }
   }
-  if (start < 0) return { chunks, nRefs: 0 };
-  const zoneIdx = [];
-  let end = start;
-  while (end < chunks.length) {
-    const k = chunks[end].kind;
-    if (k === "body" || k === "footnote") zoneIdx.push(end);
-    else if (k !== "figure" && k !== "math") break;
-    end++;
-  }
-  if (!zoneIdx.length) return { chunks, nRefs: 0 };
-
-  // 本文中の引用 (姓, 年) を収集
-  const cites = new Set();
-  for (const c of chunks.slice(0, start)) {
-    if (!["body", "caption", "footnote"].includes(c.kind)) continue;
-    for (const m of c.plain.matchAll(/\[([^\[\]<>]{4,120}?)\]/g)) {
-      for (const part of m[1].split(";")) {
-        const am = [...part.matchAll(AY_PART_RE)][0];
-        if (am) cites.add(am[1] + " " + am[2]);
-      }
-    }
-  }
-  if (cites.size < 2) return { chunks, nRefs: 0 };
-
-  // 各引用を「姓と年を両方含む」最初のゾーンチャンクに対応付ける
-  const anchorOf = new Map();
-  for (const key of cites) {
-    const [surname, year] = key.split(" ");
-    for (const zi of zoneIdx) {
-      const p = chunks[zi].plain;
-      if (p.includes(surname) && p.includes(year.slice(0, 4))) {
-        anchorOf.set(key, zi);
+  if (start < 0) {
+    // 見出しが先頭エントリに融合している場合 ("References Ansorge, U., ...")
+    // はその本文チャンクをアンカーにし、見出し部分を切り出す
+    for (let i = 0; i < chunks.length; i++) {
+      const c = chunks[i];
+      const m = c.kind === "body" ? AY_REFS_INLINE_RE.exec(c.plain) : null;
+      if (m && c.plain.length > m[0].length + 20) {
+        const rest = c.plain.slice(m[0].length);
+        chunks = [...chunks.slice(0, i),
+          { kind: "heading", page: c.page, plain: m[1], html: escapeHtml(m[1]), level: -2 },
+          { kind: "body", page: c.page, plain: rest, html: escapeHtml(rest) },
+          ...chunks.slice(i + 1)];
+        start = i + 1;
         break;
       }
     }
   }
-  if (!anchorOf.size) return { chunks, nRefs: 0 };
+  if (start < 0) return { chunks, nRefs: 0 };
+  let end = start;
+  const zone = [], keptFigs = [];
+  while (end < chunks.length) {
+    const c2 = chunks[end];
+    const k = c2.kind;
+    if (k === "body" || k === "footnote") {
+      if (BIO_START_RE.test(c2.plain)) break;   // 著者略歴が始まったら文献ゾーン終了
+      zone.push(c2);
+    }
+    else if (k === "figure" || k === "math") keptFigs.push(c2);
+    else if (k === "heading" && isJunkHeadFragment(c2.plain)) zone.push(c2);
+    else break;
+    end++;
+  }
+  if (!zone.length) return { chunks, nRefs: 0 };
 
-  zoneIdx.forEach((zi, n) => {
-    chunks[zi].kind = "ref";
-    chunks[zi].level = n + 1;
+  // ゾーンを連結し、エントリ境界で分割 (ACM形式とAPA形式を両方試して多い方を採用)
+  let joined = zone.map((c) => c.plain).join(" ")
+    .replace(/(\w)-\s+(?=[a-z])/g, "$1").replace(/\s+/g, " ").trim();
+  // 折り返しで分断されたDOI/URLを再結合 (エントリ境界の判定にURL末尾を使う)
+  joined = repairWrappedUrls(joined);
+  const findStarts = (src) => {
+    const re = new RegExp(src, "gu");
+    const out = [];
+    let mm;
+    while ((mm = re.exec(joined)) !== null) {
+      out.push(mm.index);
+      if (mm[0].length === 0) re.lastIndex++;
+    }
+    return out;
+  };
+  let entrySrc = AY_ENTRY_SRC;
+  let starts = findStarts(AY_ENTRY_SRC);
+  const startsApa = findStarts(AY_ENTRY_APA_SRC);
+  if (startsApa.length > starts.length) { entrySrc = AY_ENTRY_APA_SRC; starts = startsApa; }
+  if (starts.length < 3) return { chunks, nRefs: 0 };
+  const bounds = starts.concat([joined.length]);
+  const entries = [];
+  for (let i = 0; i < starts.length; i++) {
+    entries.push(joined.slice(starts[i], bounds[i + 1]).trim());
+  }
+
+  // 各エントリの (著者プレフィックス, 筆頭著者の姓, 年)
+  const headRe = new RegExp("^" + entrySrc, "u");
+  const firstSurname = (prefix) => {
+    const head = prefix.split(/,|\band\b|&/)[0];
+    const ws = head.match(/[\p{L}\p{M}'’\-]{2,}/gu) || [];   // アクセント付き文字も含む
+    return ws.length ? ws[ws.length - 1] : "";
+  };
+  const meta = entries.map((ent) => {
+    const m = headRe.exec(ent);
+    let prefix = ent, year = "";
+    if (m) {
+      year = m[1];
+      prefix = m[0].slice(0, m[0].lastIndexOf(m[1])).replace(/[\s(]+$/, "");
+    }
+    return { lead: firstSurname(prefix), prefix, year };
   });
 
+  // 本文中の引用 (姓, 年) を収集: [..] と (..) の中、および地の文 "Name (YEAR)"
+  const cites = new Set();
+  for (const c of chunks.slice(0, start)) {
+    if (!["body", "caption", "footnote"].includes(c.kind)) continue;
+    for (const m of c.plain.matchAll(/[\[(]([^\[\]()<>]{4,200}?)[\])]/g)) {
+      for (const part of m[1].split(/(?<!&amp);/)) {   // "&amp;" の ; は区切りでない
+        const am = new RegExp(AY_PART_SRC, "u").exec(part);
+        if (am) cites.add(am[1] + " " + am[2]);
+      }
+    }
+    for (const m of c.plain.matchAll(AY_NARR_RE)) {
+      cites.add(m[1].split(/\s+/)[0] + " " + m[2]);
+    }
+  }
+  if (cites.size < 2) return { chunks, nRefs: 0 };
+
+  // 引用 → エントリ番号: 筆頭著者の姓が一致するものを優先、無ければ著者一覧に含むもの
   const idOf = new Map();
-  for (const [key, zi] of anchorOf) idOf.set(key, chunks[zi].level);
-  const linkAy = (html) =>
-    html.replace(/\[([^\[\]<>]{4,120}?)\]/g, (whole, inner) =>
-      "[" + inner.replace(AY_PART_RE, (pm, surname, year) => {
+  for (const key of cites) {
+    const sp = key.lastIndexOf(" ");
+    const surname = key.slice(0, sp), year = key.slice(sp + 1);
+    let rid = null;
+    for (let i = 0; i < meta.length; i++) {
+      if (meta[i].year.slice(0, 4) === year.slice(0, 4) && meta[i].lead === surname) {
+        rid = i + 1; break;
+      }
+    }
+    if (rid === null) {
+      for (let i = 0; i < meta.length; i++) {
+        if (meta[i].year.slice(0, 4) === year.slice(0, 4) && meta[i].prefix.includes(surname)) {
+          rid = i + 1; break;
+        }
+      }
+    }
+    if (rid !== null) idOf.set(key, rid);
+  }
+
+  const refs = entries.map((e, i) => ({
+    kind: "ref", page: zone[0].page, plain: e, html: escapeHtml(e), level: i + 1,
+  }));
+
+  // 本文の引用をリンク化 (リンクを含むブロックは翻訳除外で包む)。
+  // 対象: 地の文 "Simeone et al. (2015)" / 括弧内 "[..]" "(..)" の各パート
+  const linkAy = (html) => {
+    html = html.replace(AY_NARR_RE, (whole, names, year) => {
+      const id = idOf.get(names.split(/\s+/)[0] + " " + year);
+      return id
+        ? wrapNoTranslate(`<a class="cite" href="#ref-${id}">${whole}</a>`) : whole;
+    });
+    return html.replace(/([\[(])([^\[\]()<>]{4,200}?)([\])])/g, (whole, open, inner, close) => {
+      const body = open + inner.replace(AY_PART_RE, (pm, surname, year) => {
         const id = idOf.get(surname + " " + year);
         return id ? `<a class="cite" href="#ref-${id}">${pm}</a>` : pm;
-      }) + "]");
+      }) + close;
+      return body.includes('class="cite"') ? wrapNoTranslate(body) : body;
+    });
+  };
   for (const c of chunks.slice(0, start)) {
     if (["body", "caption", "footnote"].includes(c.kind)) c.html = linkAy(c.html);
   }
-  return { chunks, nRefs: zoneIdx.length };
+  return { chunks: [...chunks.slice(0, start), ...refs, ...keptFigs, ...chunks.slice(end)],
+           nRefs: refs.length };
 }
 
 const URL_LINK_RE = /https?:\/\/[^\s<>"]+/g;
 // 行折り返しで分断されたURL ("https://doi.org/10.1145/ 3290605.3300233") を再結合。
 // URL末尾が / . - = のとき、続くトークンに数字が含まれていればURLの続きとみなす
 const URL_WRAP_RE = /(https?:\/\/[^\s<>"]+[/.=-])\s+(?=[^\s<>"]*\d)/g;
+// スキーム直後で折り返された "https:// www.example.com/..." も再結合する
+const URL_SCHEME_WRAP_RE = /(https?:\/\/)\s+(?=[\w-]+(?:\.[\w-]+)+)/g;
+const repairWrappedUrls = (s) =>
+  s.replace(URL_SCHEME_WRAP_RE, "$1").replace(URL_WRAP_RE, "$1");
 
 function linkifyUrls(html) {
   return html.replace(URL_LINK_RE, (m) => {
@@ -916,18 +1125,66 @@ function linkifyUrls(html) {
   });
 }
 
+// 引用ブロックを翻訳除外アイランドにする。Chrome翻訳は文を再構成する際に
+// インラインリンクの中身を並べ替えて番号とリンク先の対応を壊すため、
+// ブロック全体を translate=no で1つの不可分な単位として保護する
+const wrapNoTranslate = (inner) =>
+  `<span class="notranslate" translate="no">${inner}</span>`;
+
+// 本文中の引用を参考文献へのリンクにする。
+// [1] や [2, 5] は各番号を個別リンク。範囲引用は中間の番号も補って展開する:
+//   [4]-[7] (ブラケット間) / [4-7] / [ 4 - 7 ] (ブラケット内) → [4, 5, 6, 7]
+// リンクを含むブロックは翻訳除外 (translate=no) で包む。
 function linkCitations(html, nRefs) {
-  return html.replace(CITE_RE, (whole, inner) => {
-    const linked = inner.replace(/\d{1,3}/g, (d) => {
-      const n = parseInt(d, 10);
-      return n >= 1 && n <= nRefs
-        ? `<a class="cite" href="#ref-${n}">${n}</a>` : d;
+  const linkNum = (n) => `<a class="cite" href="#ref-${n}">${n}</a>`;
+  const numOrPlain = (n) => (n >= 1 && n <= nRefs ? linkNum(n) : String(n));
+  // 中間展開してよい範囲: 昇順・文献数以内・幅30まで (誤爆防止)
+  const validRange = (a, b) => a >= 1 && a < b && b <= nRefs && b - a <= 30;
+  const expand = (a, b) => {
+    const out = [];
+    for (let k = a; k <= b; k++) out.push(linkNum(k));
+    return out.join(", ");
+  };
+
+  // --- [4]-[7] 形式 (ブラケット間の範囲) → [4, 5, 6, 7]
+  html = html.replace(
+    /\[\s*(\d{1,3})\s*\]\s*[-–—~〜]\s*\[\s*(\d{1,3})\s*\]/g,
+    (whole, sa, sb) => {
+      const a = parseInt(sa, 10), b = parseInt(sb, 10);
+      return validRange(a, b)
+        ? wrapNoTranslate("[" + expand(a, b) + "]") : whole;
     });
-    return "[" + linked + "]";
+
+  // --- ブラケット内: 範囲は展開、それ以外の数字は個別リンク
+  return html.replace(CITE_RE, (whole, innerRaw) => {
+    const inner = innerRaw.trim();
+    const tokenRe = /(\d{1,3})\s*[-–—]\s*(\d{1,3})|(\d{1,3})/g;
+    const out = [];
+    let pos = 0, t;
+    while ((t = tokenRe.exec(inner)) !== null) {
+      out.push(inner.slice(pos, t.index));
+      if (t[3] !== undefined) {
+        out.push(numOrPlain(parseInt(t[3], 10)));
+      } else {
+        const a = parseInt(t[1], 10), b = parseInt(t[2], 10);
+        if (validRange(a, b)) {
+          out.push(expand(a, b));
+        } else {
+          const sep = t[0].replace(/[\d\s]/g, "") || "-";
+          out.push(numOrPlain(a) + sep + numOrPlain(b));
+        }
+      }
+      pos = t.index + t[0].length;
+    }
+    out.push(inner.slice(pos));
+    const body = "[" + out.join("") + "]";
+    // リンクが1つもできなかったブラケットは翻訳除外しない (単なる数字表記)
+    return body.includes('class="cite"') ? wrapNoTranslate(body) : body;
   });
 }
 
 // デバッグ用エクスポート
+export { linkCitations };
 export { extractPage, buildMathRegions, orderItems, detectInkRects, figureRects,
          overlapFrac, isMarginJunk, collectRepeatedMargins };
 
@@ -1078,6 +1335,12 @@ async function convertInner(pdfjsLib, data, opts) {
         chunk = { kind: "heading", page: p, plain, html: headHtml, level: -2 };
       } else if (/^\d{1,4}$/.test(plain)) {
         continue;  // 数字だけの孤立ブロック (取りこぼしたページ番号・軸ラベル等)
+      } else if (plain.length < 40 &&
+                 (REFS_HEAD_RE.test(plain.trim()) ||
+                  /^(Acknowledge?ments?|Appendix|Appendices)$/i.test(plain.trim()))) {
+        // 本文と同じフォントサイズの論文でも、単独行の "References" 等の
+        // セクション語は見出しとして扱う (文献再構築のアンカーになる)
+        chunk = { kind: "heading", page: p, plain, html: headHtml, level: -2 };
       } else if (isNumHead(plain) && plain.length < 90 &&
                  !SENT_END_RE.test(plain) && !plain.includes(",") &&
                  plain.split(/\s+/).length < 10 &&
@@ -1174,20 +1437,27 @@ async function convertInner(pdfjsLib, data, opts) {
     joined.push(c);
   }
 
-  // --- 段落結合 (カラム/ページまたぎ)
+  // --- 段落結合 (カラム/ページまたぎ)。
+  // 途中に図・数式・キャプション・脚注チャンクが挟まっていても、それらを
+  // 飛び越えて直近の本文段落へ結合する (図はフロートなので読み順は保たれる)。
+  // 見出しは節の区切りなので飛び越えない。
+  const SKIP_OVER = ["figure", "math", "caption", "footnote"];
   const merged = [];
   for (const c of joined) {
-    const prev = merged[merged.length - 1];
-    if (c.kind === "body" && prev && prev.kind === "body" &&
-        /^[a-z]/.test(c.plain) && !SENT_END_RE.test(prev.plain)) {
-      if (prev.plain.endsWith("-")) {
-        prev.plain = prev.plain.slice(0, -1) + c.plain;
-        prev.html = prev.html.replace(DEHYPHEN_RE, "$1") + c.html;
-      } else {
-        prev.plain += " " + c.plain;
-        prev.html += " " + c.html;
+    if (c.kind === "body" && /^[a-z]/.test(c.plain)) {
+      let j = merged.length - 1;
+      while (j >= 0 && SKIP_OVER.includes(merged[j].kind)) j--;
+      const prev = j >= 0 ? merged[j] : null;
+      if (prev && prev.kind === "body" && !SENT_END_RE.test(prev.plain)) {
+        if (prev.plain.endsWith("-")) {
+          prev.plain = prev.plain.slice(0, -1) + c.plain;
+          prev.html = prev.html.replace(DEHYPHEN_RE, "$1") + c.html;
+        } else {
+          prev.plain += " " + c.plain;
+          prev.html += " " + c.html;
+        }
+        continue;
       }
-      continue;
     }
     merged.push(c);
   }
@@ -1206,7 +1476,7 @@ async function convertInner(pdfjsLib, data, opts) {
   }
   for (const c of finalChunks) {
     if (["body", "caption", "footnote", "ref"].includes(c.kind)) {
-      if (c.kind === "footnote") c.html = c.html.replace(URL_WRAP_RE, "$1");
+      if (c.kind === "footnote") c.html = repairWrappedUrls(c.html);
       c.html = linkifyUrls(c.html);
     }
   }
@@ -1230,26 +1500,39 @@ async function convertInner(pdfjsLib, data, opts) {
       case "footnote":
         parts.push(`<p class="footnote">${c.html}</p>`);
         break;
-      case "ref":
-        parts.push(`<p class="ref" id="ref-${c.level}">${c.html}</p>`);
+      case "ref": {
+        // data-cite に原文(タグ除去・実体参照復元)を保持。Chrome翻訳は属性値を
+        // 翻訳しないため、ポップアップ表示とScholar検索に常に原文を使える
+        const citePlain = c.html.replace(/<[^>]+>/g, "")
+          .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+          .replace(/&quot;/g, '"').replace(/&#x27;|&#39;/g, "'").trim();
+        const citeAttr = citePlain.replace(/&/g, "&amp;").replace(/</g, "&lt;")
+          .replace(/"/g, "&quot;");
+        parts.push(`<p class="ref" id="ref-${c.level}" data-cite="${citeAttr}">${c.html}</p>`);
         break;
+      }
       default:
         parts.push(`<p>${c.html}</p>`);
     }
   }
 
+  // タイトルは検出した論文タイトル(h1)を優先する。PDFメタデータのTitleは
+  // 誌名や "Microsoft Word - ..." のことが多い
   let title = opts.fileName || "converted";
   try {
     const meta = await pdf.getMetadata();
     if (meta?.info?.Title) title = meta.info.Title;
   } catch (e) { /* メタデータなし */ }
+  const h1 = finalChunks.find((c) => c.kind === "heading" && c.level === 1);
+  if (h1 && h1.plain.trim().length >= 10) title = h1.plain.trim();
 
   const summary = `${n}ページ / 段落 ${finalChunks.filter((c) => c.kind === "body").length}` +
     ` / 見出し ${finalChunks.filter((c) => c.kind === "heading").length}` +
     ` / 図 ${stats.nFig} / 数式 ${stats.nMath} / インライン数式 ${stats.inlineMath}` +
     ` / 文献 ${nRefs}`;
 
-  return { bodyHtml: parts.join("\n"), title, summary, css: PAGE_CSS };
+  return { bodyHtml: parts.join("\n"), title, summary, css: PAGE_CSS,
+           popupScript: POPUP_SCRIPT };
 }
 
 export const PAGE_CSS = `
@@ -1275,4 +1558,112 @@ export const PAGE_CSS = `
   a.url:hover { text-decoration: underline; }
   img.imath { vertical-align: middle; margin: 0 2px; }
   sup { font-size: 0.7em; }
+  .cite-popup { position: fixed; z-index: 9999; max-width: 360px;
+                background: #fff; color: #222; border: 1px solid #c4c4c4;
+                border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,0.2);
+                padding: 10px 12px; font-family: "Meiryo UI", system-ui, sans-serif;
+                font-size: 13px; line-height: 1.55; text-align: left; }
+  .cite-popup-text { margin-bottom: 8px; }
+  .cite-popup-link { display: inline-block; color: #0b57d0; font-weight: bold;
+                     text-decoration: none; white-space: nowrap; }
+  .cite-popup-link:hover { text-decoration: underline; }
 `;
+
+// 引用リンクのホバーで書誌ポップアップ + Google Scholar検索リンクを出す。
+// 引用ポップアップを初期化する。拡張のビューアページ(MV3)はインラインscriptが
+// CSPで実行できないため、モジュール関数として直接呼ぶ(viewer.jsから)。
+// グローバル(document/window/setTimeout等)のみ参照する自己完結関数にしてあり、
+// 保存HTML用の文字列 POPUP_SCRIPT は toString() で生成する(単一ソース)。
+export function initCitePopups() {
+  var popup = null, hideTimer = null;
+  function cleanTitle(t) {
+    return t.replace(/^[\s"“”„'‘’]+/, "").replace(/[\s.,;:"“”]+$/, "").trim();
+  }
+  function firstSentence(t) {
+    t = t.trim();
+    var m = t.match(/\.\s+(?=[A-Z0-9"“])/);
+    var out = m ? t.slice(0, m.index) : t;
+    return cleanTitle(out.replace(/\s*\([^)]*\)\s*$/, ""));
+  }
+  // 参考文献テキストからタイトルだけを取り出す(著者・掲載誌は除く)。
+  // 形式別: 引用符付き(IEEE) / 著者-年(ACM) / 番号付き「著者. タイトル. 誌名.」
+  function extractTitle(cite) {
+    var numbered = /^\s*\[/.test(cite);
+    var s = cite.replace(/^\s*\[[^\]]*\]\s*/, "").trim();
+    var q = s.match(/["“„]([^"”]{6,}?)["”]/);
+    if (q) return cleanTitle(q[1]);
+    if (!numbered) {
+      // APA: "Igase, M. (2018). Title. Journal" / ACM: "Minamizawa. 2017. Title."
+      var apa = s.match(/\(\s*(?:19|20)\d\d[a-z]?(?:,[^)]*)?\)\.?\s+(.+)$/);
+      if (apa) return firstSentence(apa[1]);
+      var ay = s.match(/\b(?:19|20)\d\d[a-z]?\.\s+(.+)$/);
+      if (ay) return firstSentence(ay[1]);
+    }
+    var m = s.match(/[A-Za-z][a-z'’\-]+\.\s+(?=[A-Z])/);
+    return firstSentence(m ? s.slice(m.index + m[0].length) : s);
+  }
+  function schedHide() {
+    hideTimer = setTimeout(function () {
+      if (popup) popup.style.display = "none";
+    }, 300);
+  }
+  function ensure() {
+    if (popup) return popup;
+    popup = document.createElement("div");
+    popup.className = "cite-popup";
+    popup.style.display = "none";
+    popup.addEventListener("mouseenter", function () { clearTimeout(hideTimer); });
+    popup.addEventListener("mouseleave", schedHide);
+    document.body.appendChild(popup);
+    return popup;
+  }
+  function show(a, x, y) {
+    var href = a.getAttribute("href") || "";
+    var ref = document.getElementById(href.slice(1));
+    if (!ref) return;
+    var cite = (ref.getAttribute("data-cite") || ref.textContent || "").trim();
+    if (!cite) return;
+    var query = extractTitle(cite);
+    if (query.length < 8) query = cite.replace(/^\s*\[[^\]]*\]\s*/, "");
+    var p = ensure();
+    clearTimeout(hideTimer);
+    p.textContent = "";
+    var t = document.createElement("div");
+    t.className = "cite-popup-text";
+    t.setAttribute("translate", "no");
+    t.textContent = cite;
+    p.appendChild(t);
+    var link = document.createElement("a");
+    link.className = "cite-popup-link";
+    link.href = "https://scholar.google.com/scholar?q=" + encodeURIComponent(query);
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = "🔍 Google Scholar で検索";
+    p.appendChild(link);
+    p.style.display = "block";
+    p.style.visibility = "hidden";
+    var w = p.offsetWidth, h = p.offsetHeight;
+    var left = x + 14, top = y + 14;
+    if (left + w > window.innerWidth - 8) left = x - w - 14;
+    if (left < 8) left = 8;
+    if (top + h > window.innerHeight - 8) top = y - h - 14;
+    if (top < 8) top = 8;
+    p.style.left = left + "px";
+    p.style.top = top + "px";
+    p.style.visibility = "visible";
+  }
+  var links = document.querySelectorAll("a.cite");
+  for (var i = 0; i < links.length; i++) {
+    var a = links[i];
+    if (a.__citeBound) continue;
+    a.__citeBound = true;
+    a.addEventListener("mouseenter", (function (el) {
+      return function (e) { show(el, e.clientX, e.clientY); };
+    })(a));
+    a.addEventListener("mouseleave", schedHide);
+  }
+}
+
+// 保存HTML(通常ページ)用: 末尾に置いて自己実行するインライン文字列。
+// 拡張ページでは使わない(viewer.jsが initCitePopups() を直接呼ぶ)。
+export const POPUP_SCRIPT = "(" + initCitePopups.toString() + ")();";
